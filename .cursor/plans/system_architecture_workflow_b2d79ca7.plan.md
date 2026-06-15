@@ -28,7 +28,7 @@ flowchart TB
         Running[_running_task]
         Exec[_current_execution]
         Guard[_is_queue_processing]
-        ProcTask[_processor_task]
+        Processor[_processor]
         IdleTask[_idle_task]
         Gen[_activity_generation]
         IdleHook["on_queue_idle (optional)"]
@@ -36,7 +36,7 @@ flowchart TB
 
     App -->|await submit_task| Submit
     App -->|partial callback at init| IdleHook
-    App -->|await is_queue_processing etc.| CV
+    App -->|await is_queue_processing| CV
     Submit --> Deque
     Submit -->|_ensure_processor_started_locked| RunProc
     Submit -->|notify| CV
@@ -49,6 +49,7 @@ flowchart TB
     Process --> Guard
     Process -->|queue drains| IdleHook
     Deque --> CV
+    Processor --> RunProc
 ```
 
 ## Core Components
@@ -70,21 +71,22 @@ flowchart TB
 | `_on_queue_idle` | Optional `Callable[..., Any] \| None` — sync or async hook invoked when the queue fully drains |
 | `_cv` | `asyncio.Condition` — synchronizes all queue mutations, processor wakeups, and public snapshots |
 | `_activity_generation` | Incremented on each accepted submit; used to detect stale idle notifications |
-| `_processor_task` | Handle to the long-lived `_run_processor` asyncio task |
+| `_processor` | Handle to the long-lived `_run_processor` asyncio task |
 | `_idle_task` | Handle to an in-flight idle callback; cancelled by `submit_task` when new work arrives |
 
-### Public async accessors
+### Public async accessor
 
-All external reads of queue state go through methods that acquire `_cv`:
+External reads of processing state go through a single method that acquires `_cv`:
 
 | Method | Returns |
 |--------|---------|
-| `get_highest_active_level()` | Max `TaskLevel` among running + queued tasks, or `None` |
-| `is_queue_processing()` | Whether the processor is actively dequeuing or executing |
-| `get_running_task()` | Current `QueuedTask` or `None` |
-| `queued_task_count()` | Number of tasks waiting in `_queue` |
+| `is_queue_processing()` | `True` while the processor is actively dequeuing or executing; `False` while blocked waiting for work |
 
-Internal helper `_highest_active_level_locked()` is used by `submit_task` while already holding `_cv`.
+Internal helper `_highest_active_level_locked()` computes the max `TaskLevel` among running and queued tasks; it is used by `submit_task` while already holding `_cv` and is not exposed publicly.
+
+### Usage from sync code
+
+`submit_task` is async and must run on the event loop. From a synchronous caller, schedule it with `asyncio.create_task(level_filtered_task_queue.submit_task(queued_task))` (or an equivalent task manager) rather than calling it directly.
 
 ### Constructor: `on_queue_idle`
 
@@ -173,7 +175,7 @@ flowchart TD
     EvictLoop -->|No| Append[append to _queue]
     Append --> Gen[_activity_generation += 1]
     Gen --> CancelIdle[_cancel_idle_task_locked]
-    CancelIdle --> PreemptCheck{Running task outranked by queue front AND can_interrupt_running?}
+    CancelIdle --> PreemptCheck{Queue front outranks running AND can_interrupt_running?}
     PreemptCheck -->|Yes| Cancel[cancel _current_execution - Behavior 2]
     PreemptCheck -->|No| Notify
     Cancel --> Notify[_cv.notify]
@@ -189,19 +191,24 @@ flowchart TD
 - **Preempt (Behavior 2):** After append, if queue front (`_queue[0]`) outranks `_running_task` and has `can_interrupt_running=True`, cancel `_current_execution` immediately — preemption is triggered at submit time, not via a polling loop.
 - **Wake processor:** `_cv.notify()` wakes the long-lived processor if it is blocked on `_cv.wait()`.
 
+Rejected and evicted tasks are logged at `WARNING` and `DEBUG` respectively via the module `LOGGER`.
+
 ## Workflow 2: Queue Processing (`_run_processor` / `_process_queue`)
 
-`_run_processor` wraps `_process_queue` in a restart loop for crash recovery. `_process_queue` is an infinite loop that waits on `_cv` when idle and dequeues work when notified.
+`_run_processor` wraps `_process_queue` in a restart loop for crash recovery. `asyncio.CancelledError` is re-raised so the processor can shut down cleanly; any other exception is logged and the loop restarts, notifying the condition if work remains queued.
+
+`_process_queue` is an infinite loop that waits on `_cv` when idle and dequeues work when notified.
 
 ```mermaid
 flowchart TD
     Start[_run_processor started on first submit] --> TryLoop[try await _process_queue]
-    TryLoop -->|exception| LogCrash[log exception + sleep 0]
+    TryLoop -->|CancelledError| Shutdown[re-raise for clean shutdown]
+    TryLoop -->|other exception| LogCrash[log exception + sleep 0]
     LogCrash --> NotifyIfWork[notify if _queue non-empty]
     NotifyIfWork --> TryLoop
     TryLoop --> Inner[_process_queue infinite loop]
     Inner --> WaitEmpty{queue empty?}
-    WaitEmpty -->|Yes| Block["async with _cv: _is_queue_processing = False, _cv.wait()"]
+    WaitEmpty -->|Yes| Block["async with _cv: clear running state, _is_queue_processing = False, _cv.wait()"]
     Block --> WaitEmpty
     WaitEmpty -->|No| LockPop["async with _cv: popleft, set _running_task, create execution"]
     LockPop --> Wait["await wait_for(shield, timeout) outside _cv"]
@@ -223,9 +230,9 @@ flowchart TD
 
 **Behavior mapping:**
 
-- **Behavior 1 (one at a time):** `_process_queue` awaits each coroutine (plus `_await_execution_finished`) before dequeuing the next; only one `_processor_task` is ever started.
+- **Behavior 1 (one at a time):** `_process_queue` awaits each coroutine (plus `_await_execution_finished`) before dequeuing the next; only one `_processor` task is ever started.
 - **Behavior 2 (preemption):** Cancel on submit raises `CancelledError` in the running `wait_for`; processor joins the cancelled execution, then continues to next queued task.
-- **Behavior 2 inverse:** Lower-level tasks never preempt — preemption requires `next_task_in_queue.level > running_task.level`.
+- **Behavior 2 inverse:** Lower-level tasks never preempt — preemption requires `_queue[0].level > running_task.level` and `can_interrupt_running=True`.
 - **Behavior 5 (timeout):** `asyncio.wait_for(asyncio.shield(...), timeout)` cancels overlong tasks; loop continues to next item after join.
 - **Idle hook:** When the queue empties after a task finishes, optional `on_queue_idle` fires once per drain cycle (not while tasks remain queued).
 
@@ -262,7 +269,7 @@ sequenceDiagram
     end
 ```
 
-**Execution detail:** Task name and level are captured in local variables at dequeue time for logging (no unsynchronized reads of `_running_task`). `asyncio.shield` prevents the inner task from being immediately destroyed on timeout/cancel at the `wait_for` boundary; `_await_execution_finished` then joins the execution task before the next item is dequeued.
+**Execution detail:** Task name and level are captured in local variables at dequeue time for logging (no unsynchronized reads of `_running_task`). `asyncio.shield` prevents the inner task from being immediately destroyed on timeout/cancel at the `wait_for` boundary; `_await_execution_finished` then joins the execution task before the next item is dequeued, suppressing `CancelledError` from propagating to the processor.
 
 ## Workflow 4: Queue Idle Hook (`on_queue_idle`)
 
@@ -285,7 +292,7 @@ sequenceDiagram
     Process->>CV: release
     Process->>IdleTask: await
 
-  alt new work arrives during async idle
+    alt new work arrives during async idle
         Submit->>CV: acquire
         Submit->>Submit: _activity_generation += 1
         Submit->>IdleTask: cancel via _cancel_idle_task_locked
@@ -315,12 +322,12 @@ flowchart LR
         Submit -->|async with| CV
         Process -->|popleft + state under _cv| Deque
         Process -->|await coroutine + join| OutsideCV[outside _cv]
-        Accessors[get_highest_active_level etc.]
-        Accessors -->|async with| CV
+        Accessor[is_queue_processing]
+        Accessor -->|async with| CV
     end
 
     subgraph guards [Concurrency guards]
-        ProcTask[_processor_task - single long-lived processor]
+        ProcTask[_processor - single long-lived processor]
         Gen[_activity_generation - stale idle detection]
         IdleCancel[_idle_task cancel on submit]
         Join[_await_execution_finished - no coroutine overlap]
@@ -331,13 +338,14 @@ flowchart LR
 | Concern | Mechanism |
 |---------|-----------|
 | Concurrent `submit_task` calls | `_cv` wraps reject/evict/append/preempt decision |
-| Multiple processor loops | `_ensure_processor_started_locked` only under `_cv`; one `_processor_task` |
+| Multiple processor loops | `_ensure_processor_started_locked` only under `_cv`; one `_processor` task |
 | Processor blocked on empty queue | `_cv.wait()` until `notify()` from `submit_task` |
 | Preemption race | Preempt check runs inside `submit_task` under `_cv` before releasing |
 | Coroutine overlap after cancel | `_await_execution_finished` joins execution before next dequeue |
 | Stale idle notification | `_activity_generation` double-check + cancel in-flight `_idle_task` |
-| Unsynchronized state reads | Private `_queue` / `_running_task`; public async accessors only |
+| Unsynchronized state reads | Private `_queue` / `_running_task`; only `is_queue_processing()` is public |
 | Processor crash | `_run_processor` logs, restarts, and `notify()`s if work is queued |
+| Processor shutdown | `CancelledError` propagates out of `_run_processor` without restart |
 | Cross-thread submit | **Not supported** — single event loop, coroutine-only use |
 
 ## End-to-End Example (Preemption + Eviction)
@@ -369,7 +377,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Waiting: queue created
-    Waiting --> Processing: first submit starts _processor_task + notify
+    Waiting --> Processing: first submit starts _processor + notify
     Processing --> Running: popleft, set _running_task
     Running --> Running: await coroutine + join
     Running --> Running: preempted, join, next task dequeued
@@ -386,7 +394,7 @@ stateDiagram-v2
 | Behavior | Description | Test |
 |----------|-------------|------|
 | 1 | Only one task runs at a time | `test_only_one_task_runs_at_a_time` |
-| 2a | No preempt by default | `test_higher_level_does_not_interrupt_running_task_with_can_interrupt_running_false` |
+| 2a | No preempt by default | `test_higher_level_not_interrupt_running_task_with_can_interrupt_running_false` |
 | 2b | Preempt when `can_interrupt_running=True` | `test_higher_level_interrupt_running_task_with_can_interrupt_running_true` |
 | 3 | Higher-level incoming evicts lower queued | `test_higher_level_incoming_tasks_evicts_lower_queued` |
 | 4a | Reject when higher-level queued | `test_do_not_enqueue_incoming_task_when_higher_queued` |
@@ -406,13 +414,13 @@ stateDiagram-v2
 
 ## Known Design Notes
 
-- `submit_task` is **async** — uses `asyncio.Condition` and must be called from the event loop.
+- `submit_task` is **async** — uses `asyncio.Condition` and must be called from the event loop; from sync code, schedule via `asyncio.create_task(...)`.
 - Preemption is **submit-driven** (cancel inside `submit_task`), not poll-driven.
 - A **single long-lived processor** (`_run_processor` → `_process_queue`) waits on `_cv` when idle; it is started lazily on the first accepted submit under `_cv`.
 - `_process_queue` pops and sets `_running_task` / `_current_execution` under `_cv`, but awaits each coroutine outside `_cv`; `_await_execution_finished` joins the execution before the next dequeue.
 - `_is_queue_processing` is `True` while dequeuing or executing, `False` while blocked on `_cv.wait()` — query via `await is_queue_processing()`.
-- Queue state (`_queue`, `_running_task`) is private; use async accessors for external reads.
+- Queue state (`_queue`, `_running_task`) is private; `is_queue_processing()` is the only public state accessor.
 - `on_queue_idle` is optional, sync or async, invoked outside `_cv` with generation-based stale-idle guards; in-flight async idle callbacks are cancelled when new work is accepted.
-- `_run_processor` restarts automatically if `_process_queue` raises unexpectedly.
+- `_run_processor` restarts automatically on unexpected exceptions; `CancelledError` propagates for clean shutdown.
 - Default per-task `timeout` is **120 seconds** (`QueuedTask.timeout`).
 - **Not thread-safe** across OS threads — single event loop, coroutine-only use.

@@ -2,14 +2,16 @@ import asyncio
 from functools import partial
 
 import pytest
-from task_queue import LevelFilteredTaskQueue, QueuedTask, TaskLevel
+from task_queue import (
+    LevelFilteredTaskQueue,
+    QueuedTask,
+    TaskLevel,
+)
 
-pytestmark = pytest.mark.filterwarnings("ignore::RuntimeWarning")
 
 # Required Behavior 1: Only one task runs at a time
 @pytest.mark.asyncio
 async def test_only_one_task_runs_at_a_time() -> None:
-
     level_filtered_task_queue = LevelFilteredTaskQueue()
 
     active = 0
@@ -33,9 +35,11 @@ async def test_only_one_task_runs_at_a_time() -> None:
     await asyncio.sleep(0.2)
     assert max_active == 1
 
-# Required Behavior 2a: Higher level task from queue do not interrupt running task if can_interrupt_running is False
+
+# Required Behavior 2a: Higher level task from queue do not interrupt running task if
+# can_interrupt_running is False
 @pytest.mark.asyncio
-async def test_higher_level_does_not_interrupt_running_task_with_can_interrupt_running_false() -> None:
+async def test_higher_level_not_interrupt_running_task_with_can_interrupt_running_false() -> None:
     level_filtered_task_queue = LevelFilteredTaskQueue()
 
     low_cancelled = asyncio.Event()
@@ -64,7 +68,9 @@ async def test_higher_level_does_not_interrupt_running_task_with_can_interrupt_r
     assert not low_cancelled.is_set()
     assert order == ["low_done", "high_done"]
 
-# Required Behavior 2b: Higher level task from queue interrupt running task if can_interrupt_running is True
+
+# Required Behavior 2b: Higher level task from queue interrupt running task if
+# can_interrupt_running is True
 @pytest.mark.asyncio
 async def test_higher_level_interrupt_running_task_with_can_interrupt_running_true() -> None:
     level_filtered_task_queue = LevelFilteredTaskQueue()
@@ -85,7 +91,9 @@ async def test_higher_level_interrupt_running_task_with_can_interrupt_running_tr
         order.append("high_done")
 
     task_low = QueuedTask(level=TaskLevel.LOW, name="low", coroutine=low())
-    task_high = QueuedTask(level=TaskLevel.HIGH, name="high", coroutine=high(), can_interrupt_running=True)
+    task_high = QueuedTask(
+        level=TaskLevel.HIGH, name="high", coroutine=high(), can_interrupt_running=True
+    )
 
     # long sleep in low task, so it has been running when high task are submitted
     assert await level_filtered_task_queue.submit_task(task_low)
@@ -119,7 +127,8 @@ async def test_higher_level_incoming_tasks_evicts_lower_queued() -> None:
     task_high = QueuedTask(level=TaskLevel.HIGH, name="high", coroutine=high())
     task_critical = QueuedTask(level=TaskLevel.CRITICAL, name="critical", coroutine=critical())
 
-    # long sleep in low task, so it has beee running when high task and critical task are submitted
+    # long sleep in low task, so it has beee running when high task and critical task are
+    # submitted
     assert await level_filtered_task_queue.submit_task(task_low)
     await asyncio.sleep(0.02)
     # high task and critical task are in queue and thus high task is removed from queue
@@ -129,7 +138,9 @@ async def test_higher_level_incoming_tasks_evicts_lower_queued() -> None:
     await asyncio.sleep(0.4)
     assert ran == ["low", "critical"]
 
-# Required Behavior 4a: Do not enqueue an incoming task if any task queued has strictly higher priority
+
+# Required Behavior 4a: Do not enqueue an incoming task if any task queued has strictly
+# higher priority
 @pytest.mark.asyncio
 async def test_do_not_enqueue_incoming_task_when_higher_queued() -> None:
     level_filtered_task_queue = LevelFilteredTaskQueue()
@@ -148,12 +159,12 @@ async def test_do_not_enqueue_incoming_task_when_higher_queued() -> None:
         await asyncio.sleep(0)
         ran.append("rejected")
 
-    
     task_blocker = QueuedTask(level=TaskLevel.NORMAL, name="blocker", coroutine=blocker())
     task_high_queued = QueuedTask(level=TaskLevel.HIGH, name="high_queued", coroutine=high_queued())
     task_rejected = QueuedTask(level=TaskLevel.NORMAL, name="rejected", coroutine=rejected())
 
-    # long sleep in broker task, so it has been running when high_queued task and rejected task are submitted
+    # long sleep in broker task, so it has been running when high_queued task and
+    # rejected task are submitted
     assert await level_filtered_task_queue.submit_task(task_blocker)
     await asyncio.sleep(0.02)
     assert await level_filtered_task_queue.submit_task(task_high_queued)
@@ -166,7 +177,8 @@ async def test_do_not_enqueue_incoming_task_when_higher_queued() -> None:
     assert ran == ["blocker", "high_queued"]
 
 
-# Required Behavior 4b: Do not enqueue an incoming task if running task has strictly higher level
+# Required Behavior 4b: Do not enqueue an incoming task if running task has
+# strictly higher level
 @pytest.mark.asyncio
 async def test_do_not_enqueue_incoming_task_when_higher_running() -> None:
     level_filtered_task_queue = LevelFilteredTaskQueue()
@@ -181,7 +193,6 @@ async def test_do_not_enqueue_incoming_task_when_higher_running() -> None:
         await asyncio.sleep(0)
         ran.append("rejected")
 
-    
     task_blocker = QueuedTask(level=TaskLevel.HIGH, name="blocker", coroutine=blocker())
     task_rejected = QueuedTask(level=TaskLevel.NORMAL, name="rejected", coroutine=rejected())
 
@@ -193,6 +204,7 @@ async def test_do_not_enqueue_incoming_task_when_higher_running() -> None:
     assert not accepted
     await asyncio.sleep(0.35)
     assert ran == ["blocker"]
+
 
 # Required Behavior 5: Interrupt running task if its predefined task timeout happens
 @pytest.mark.asyncio
@@ -209,12 +221,7 @@ async def test_task_times_out_when_exceeding_limit() -> None:
         await asyncio.sleep(0)
         ran.append("fast_done")
 
-    task_slow = QueuedTask(
-        level=TaskLevel.NORMAL,
-        name="slow",
-        coroutine=slow(),
-        timeout=0.05,
-    )
+    task_slow = QueuedTask(level=TaskLevel.NORMAL, name="slow", coroutine=slow(), timeout=0.05)
     task_fast = QueuedTask(level=TaskLevel.NORMAL, name="fast", coroutine=fast())
 
     assert await level_filtered_task_queue.submit_task(task_slow)
@@ -226,6 +233,7 @@ async def test_task_times_out_when_exceeding_limit() -> None:
     assert ran == ["fast_done"]
 
 
+# Idle callback is not called between back-to-back tasks
 @pytest.mark.asyncio
 async def test_on_queue_idle_not_called_between_back_to_back_tasks() -> None:
     idle_count = 0
@@ -254,13 +262,15 @@ async def test_on_queue_idle_not_called_between_back_to_back_tasks() -> None:
             QueuedTask(level=TaskLevel.NORMAL, name="second", coroutine=second())
         )
 
-    asyncio.create_task(submit_second_on_finish())
+    task = asyncio.create_task(submit_second_on_finish())
     await asyncio.sleep(0.08)
     assert idle_count == 0
     await asyncio.sleep(0.15)
     assert idle_count == 1
+    await task
 
 
+# Idle callback is called once when the queue drains
 @pytest.mark.asyncio
 async def test_on_queue_idle_runs_once_when_queue_drains() -> None:
     idle_count = 0
@@ -271,9 +281,8 @@ async def test_on_queue_idle_runs_once_when_queue_drains() -> None:
 
     level_filtered_task_queue = LevelFilteredTaskQueue(on_queue_idle=on_idle)
 
-    async def work(name: str) -> None:
+    async def work(_name: str) -> None:
         await asyncio.sleep(0.05)
-        return name
 
     assert await level_filtered_task_queue.submit_task(
         QueuedTask(level=TaskLevel.NORMAL, name="a", coroutine=work("a"))
@@ -289,6 +298,7 @@ async def test_on_queue_idle_runs_once_when_queue_drains() -> None:
     assert not await level_filtered_task_queue.is_queue_processing()
 
 
+# Idle callback with partial binds arguments is called once when the queue drains
 @pytest.mark.asyncio
 async def test_on_queue_idle_partial_binds_args_before_level_filtered_task_queue() -> None:
     received: list[str] = []
@@ -297,7 +307,7 @@ async def test_on_queue_idle_partial_binds_args_before_level_filtered_task_queue
         received.append(mode)
 
     level_filtered_task_queue = LevelFilteredTaskQueue(on_queue_idle=partial(on_idle, "manual"))
-    
+
     async def work() -> None:
         await asyncio.sleep(0.05)
 
@@ -308,6 +318,7 @@ async def test_on_queue_idle_partial_binds_args_before_level_filtered_task_queue
     assert received == ["manual"]
 
 
+# Aysnc Idle callback is awaited before the queue processor waits for a new task
 @pytest.mark.asyncio
 async def test_on_queue_idle_awaits_async_callback() -> None:
     idle_count = 0
@@ -332,6 +343,8 @@ async def test_on_queue_idle_awaits_async_callback() -> None:
     assert not await level_filtered_task_queue.is_queue_processing()
 
 
+# Async Idle callback with partial binds arguments is awaited before
+# the queue processor waits for a new task
 @pytest.mark.asyncio
 async def test_on_queue_idle_partial_binds_args_for_async_callback() -> None:
     received: list[str] = []
@@ -340,9 +353,7 @@ async def test_on_queue_idle_partial_binds_args_for_async_callback() -> None:
         await asyncio.sleep(0.02)
         received.append(mode)
 
-    level_filtered_task_queue = LevelFilteredTaskQueue(
-        on_queue_idle=partial(on_idle, "manual")
-    )
+    level_filtered_task_queue = LevelFilteredTaskQueue(on_queue_idle=partial(on_idle, "manual"))
 
     async def work() -> None:
         await asyncio.sleep(0.05)
